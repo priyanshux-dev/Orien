@@ -114,8 +114,8 @@ export default function Sidebar({
       ? isOverTarget
         ? "Blocked (>6k) — Undo or Horizon"
         : isWarningZone
-        ? "4.5k–6k · medium reasoning"
-        : "Carbon optimal · medium"
+        ? "4.5k–6k ·  Optimal"
+        : "Carbon optimal · Optimal"
       : isOverTarget
       ? "Blocked (>30k) — Undo or untick"
       : isWarningZone

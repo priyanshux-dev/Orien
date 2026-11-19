@@ -1,17 +1,25 @@
 "use client";
 
 import { useCallback, useState } from "react";
-import { getContextStatus, getFilePath, type OrienEngine } from "@/lib/context";
+import {
+  ENGINE_CONFIG,
+  MAX_FILE_CHARS,
+  getContextStatus,
+  getFilePath,
+  type OrienEngine,
+} from "@/lib/context";
 import {
   analyzeRepository,
   type RepositoryAnalysis,
 } from "@/lib/repositoryAnalyzer";
 import Sidebar from "@/components/Sidebar";
-import Header from "@/components/Header";
+import Header, { type WorkspaceMode } from "@/components/Header";
 import Workspace from "@/components/Workspace";
 import ProposalPanel from "@/components/ProposalPanel";
 import AskOrienPanel from "@/components/AskOrienPanel";
-import ProposalChatPanel from "@/components/ProposalChatPanel";
+import ProposalChatPanel, {
+  type ProposalChatMessage,
+} from "@/components/ProposalChatPanel";
 import DependencyGraph from "@/components/DependencyGraph";
 import type { EditProposal } from "@/lib/type";
 
@@ -21,12 +29,16 @@ export default function Home() {
   const [filePreview, setFilePreview] = useState("");
   const [previewFileName, setPreviewFileName] = useState("");
 
+  // Workspace Safety Mode: "opensource" (default, locked disk) vs "project" (Option A folder write)
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("opensource");
+  const [projectDirHandle, setProjectDirHandle] = useState<any | null>(null);
+
   // Context files + Undo/Redo history stack
   const [contextFiles, setContextFiles] = useState<File[]>([]);
   const [undoStack, setUndoStack] = useState<File[][]>([]);
   const [redoStack, setRedoStack] = useState<File[][]>([]);
 
-  // Repository & Dependencies Analysis (lifted so it moves smoothly between Main Screen & Ask Orien)
+  // Repository & Dependencies Analysis
   const [analysis, setAnalysis] = useState<RepositoryAnalysis | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState("");
@@ -34,6 +46,13 @@ export default function Home() {
 
   const [proposal, setProposal] = useState<EditProposal | null>(null);
   const [engine, setEngine] = useState<OrienEngine>("carbon");
+
+  // Lifted Proposal Chat state + 2-Gate Safety Audit state
+  const [proposalChatMessages, setProposalChatMessages] = useState<
+    ProposalChatMessage[]
+  >([]);
+  const [isBugAudited, setIsBugAudited] = useState(false);
+  const [autoAuditTrigger, setAutoAuditTrigger] = useState(0);
 
   // Split view (original vs proposed)
   const [splitView, setSplitView] = useState(false);
@@ -47,7 +66,6 @@ export default function Home() {
       ? (selectedFiles[0].webkitRelativePath || "").split("/")[0]
       : "";
 
-  // Helper to update contextFiles while recording Undo/Redo snapshots
   const commitContextChange = useCallback(
     (updater: (current: File[]) => File[]) => {
       setContextFiles((current) => {
@@ -143,6 +161,114 @@ export default function Home() {
     });
   }
 
+  function handleProposalChange(nextProposal: EditProposal | null) {
+    setProposal(nextProposal);
+    setProposalChatMessages([]);
+    setIsBugAudited(false);
+    setAutoAuditTrigger(0);
+  }
+
+  // Self-Healing Loop: Automatically pulls target + failing test files into context and regenerates patch
+  async function handleSelfHealProposal(
+    failureReport: string,
+    targetPaths: string[]
+  ) {
+    const activeEngine = ENGINE_CONFIG[engine];
+    const normalizedTargets = targetPaths.map((p) => p.replace(/\\/g, "/"));
+
+    // Ensure failing files & discovered test files are included in context
+    const matchedFiles = selectedFiles.filter((file) => {
+      if (getContextStatus(file) !== "ok") return false;
+      const fp = getFilePath(file).replace(/\\/g, "/");
+      return normalizedTargets.some(
+        (t) => fp === t || fp.endsWith(`/${t}`) || t.endsWith(`/${fp}`)
+      );
+    });
+
+    const combinedMap = new Map(
+      contextFiles.map((f) => [getFilePath(f), f])
+    );
+    matchedFiles.forEach((f) => combinedMap.set(getFilePath(f), f));
+    const healFiles = Array.from(combinedMap.values());
+
+    if (healFiles.length > 0) {
+      commitContextChange(() => healFiles);
+    }
+
+    const contextParts: string[] = [];
+    let totalCharacters = 0;
+
+    for (const file of healFiles) {
+      if (getContextStatus(file) !== "ok") continue;
+      if (totalCharacters >= activeEngine.maxChars) break;
+
+      const content = await file.text();
+      const remaining = activeEngine.maxChars - totalCharacters;
+      const available = Math.min(MAX_FILE_CHARS, remaining);
+      const block = `FILE: ${getFilePath(file)}\n${content.slice(0, available)}`;
+      contextParts.push(block);
+      totalCharacters += block.length;
+    }
+
+    const response = await fetch("http://127.0.0.1:8000/edit", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        message: failureReport,
+        repository_context: contextParts.join("\n\n"),
+        engine,
+        reasoning_effort: activeEngine.reasoningEffort,
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || "Self-healing edit request failed.");
+    }
+    if (!data.success || !Array.isArray(data.changes)) {
+      throw new Error("Orien returned an invalid self-heal response.");
+    }
+
+    handleProposalChange({
+      summary: data.summary,
+      changes: data.changes,
+    });
+  }
+
+  async function handleRequestProjectFolder() {
+    try {
+      const picker = (window as any).showDirectoryPicker;
+      if (!picker) {
+        alert(
+          "Your browser does not support direct folder access. Please use Edge or Chrome."
+        );
+        return null;
+      }
+      const handle = await picker({ mode: "readwrite" });
+      setProjectDirHandle(handle);
+      setWorkspaceMode("project");
+      return handle;
+    } catch {
+      return null;
+    }
+  }
+
+  async function handleSelectWorkspaceMode(mode: WorkspaceMode) {
+    if (mode === "opensource") {
+      setWorkspaceMode("opensource");
+      return;
+    }
+
+    if (projectDirHandle) {
+      setWorkspaceMode("project");
+      return;
+    }
+
+    await handleRequestProjectFolder();
+  }
+
   async function handleFilesSelected(files: File[]) {
     setSelectedFiles(files);
     setContextFiles([]);
@@ -150,8 +276,10 @@ export default function Home() {
     setRedoStack([]);
     setAnalysis(null);
     setAnalysisError("");
-    setProposal(null);
+    handleProposalChange(null);
     setSplitView(false);
+    setWorkspaceMode("opensource");
+    setProjectDirHandle(null);
 
     if (files.length > 0) {
       await handleSelectFile(files[0]);
@@ -178,9 +306,13 @@ export default function Home() {
     }
   }
 
+  function handleTriggerSafetyAudit() {
+    setShowProposalChat(true);
+    setAutoAuditTrigger((prev) => prev + 1);
+  }
+
   const contextFilePaths = contextFiles.map((file) => getFilePath(file));
 
-  // Reusable Dependencies & Analysis Card (renders in Main Screen before proposal, moves to Ask Orien after proposal)
   const dependenciesSection =
     selectedFiles.length > 0 ? (
       <div className="border border-white/10 rounded-2xl p-6 bg-white/[0.02]">
@@ -377,7 +509,6 @@ export default function Home() {
 
   return (
     <main className="h-screen overflow-hidden bg-[#09090b] text-white flex [color-scheme:dark] [&_*]:[scrollbar-width:none] [&_*::-webkit-scrollbar]:hidden">
-      {/* Left: logo, token meter, undo/redo, selected files drawer, workspace tree */}
       <Sidebar
         files={selectedFiles}
         contextFiles={contextFiles}
@@ -392,10 +523,13 @@ export default function Home() {
         onRedo={handleRedoContext}
       />
 
-      {/* Right of the sidebar */}
       <div className="relative flex-1 min-w-0 min-h-0 flex">
         <Header
           repoName={repoName}
+          hasFiles={selectedFiles.length > 0}
+          workspaceMode={workspaceMode}
+          hasProjectWriteHandle={projectDirHandle !== null}
+          onSelectWorkspaceMode={handleSelectWorkspaceMode}
           showAsk={showAsk}
           showProposalChat={showProposalChat}
           onToggleAsk={() => setShowAsk((value) => !value)}
@@ -405,9 +539,10 @@ export default function Home() {
           splitView={splitView}
           hasProposal={proposal !== null}
           onToggleSplit={() => setSplitView((value) => !value)}
+          onAddFiles={handleAddFiles}
+          onResetWorkspace={() => handleFilesSelected([])}
         />
 
-        {/* Center: Main Screen (Dependencies before proposal; Proposal once called) + Ask Orien below */}
         <div className="flex-1 min-w-0 min-h-0 flex flex-col">
           {proposal === null && selectedFiles.length > 0 ? (
             <section className="flex-1 min-h-0 overflow-y-auto pt-20 px-6 pb-6">
@@ -415,9 +550,17 @@ export default function Home() {
             </section>
           ) : (
             <ProposalPanel
+              repoName={repoName}
               proposal={proposal}
               splitView={splitView}
               selectedFiles={selectedFiles}
+              workspaceMode={workspaceMode}
+              projectDirHandle={projectDirHandle}
+              onRequestProjectFolder={handleRequestProjectFolder}
+              isBugAudited={isBugAudited}
+              chatMessages={proposalChatMessages}
+              onTriggerSafetyAudit={handleTriggerSafetyAudit}
+              onSelfHealProposal={handleSelfHealProposal}
             />
           )}
 
@@ -436,15 +579,19 @@ export default function Home() {
               activeFile={activeFile}
               filePreview={filePreview}
               previewFileName={previewFileName}
-              onProposalChange={setProposal}
+              onProposalChange={handleProposalChange}
             />
           </AskOrienPanel>
         </div>
 
-        {/* Right: proposal chat */}
         <ProposalChatPanel
           visible={showProposalChat}
           onClose={() => setShowProposalChat(false)}
+          proposal={proposal}
+          messages={proposalChatMessages}
+          onMessagesChange={setProposalChatMessages}
+          autoAuditTrigger={autoAuditTrigger}
+          onAuditCompleted={() => setIsBugAudited(true)}
         />
       </div>
     </main>
