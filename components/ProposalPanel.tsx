@@ -6,6 +6,7 @@ import SplitView from "@/components/SplitView";
 import type { WorkspaceMode } from "@/components/Header";
 import type { ProposalChatMessage } from "@/components/ProposalChatPanel";
 import type { EditProposal, ProposedChange } from "@/lib/types";
+import { API_BASE_URL, getOrienHeaders } from "@/lib/api";
 
 type ProposalPanelProps = {
   repoName: string;
@@ -488,11 +489,9 @@ export default function ProposalPanel({
     setCheckResult(null);
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/run-checks", {
+      const response = await fetch(`${API_BASE_URL}/run-checks`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: getOrienHeaders(),
         body: JSON.stringify({
           project_root: localRepoPath.trim(),
           target_files: proposal.changes.map((c) => c.file),
@@ -648,11 +647,9 @@ export default function ProposalPanel({
     setSavedNotice("");
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/draft-issue", {
+      const response = await fetch(`${API_BASE_URL}/draft-issue`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: getOrienHeaders(),
         body: JSON.stringify({
           proposal_summary: focusedSummary,
           changes: chosenChanges,

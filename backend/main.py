@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -16,39 +16,48 @@ load_dotenv()
 
 app = FastAPI(title="Orien Backend")
 
+# Allow local Next.js + any deployed Vercel/custom frontend origin
+ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "*")
+ALLOWED_ORIGINS = (
+    ["*"]
+    if ALLOWED_ORIGINS_RAW.strip() == "*"
+    else [o.strip() for o in ALLOWED_ORIGINS_RAW.split(",") if o.strip()]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Optional Owner Passcode: when set in Render/production .env, visitors MUST provide
+# their own BYOK keys unless they enter this secret passcode!
+OWNER_PASSCODE = os.getenv("OWNER_PASSCODE", "").strip()
+
 # 1. Ask Orien (/chat & /draft-issue) -> CoArena
-CHAT_API_KEY = os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY")
+SERVER_CHAT_API_KEY = os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY")
 CHAT_BASE_URL = os.getenv("AI_BASE_URL", "https://coarena.ai/api/v1")
 CHAT_MODEL = os.getenv("AI_MODEL", "gemini-3-8-flash")
 CHAT_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "16384"))
 CHAT_REASONING_EFFORT = os.getenv("AI_REASONING_EFFORT", "medium")
 
 # 2. Orien Carbon (Fast 6k Edits) -> CoArena DeepSeek V4.1 Flash
-CARBON_API_KEY = os.getenv("CARBON_AI_API_KEY") or CHAT_API_KEY
+SERVER_CARBON_API_KEY = os.getenv("CARBON_AI_API_KEY") or SERVER_CHAT_API_KEY
 CARBON_BASE_URL = os.getenv("CARBON_AI_BASE_URL", "https://coarena.ai/api/v1")
 CARBON_MODEL = os.getenv("CARBON_AI_MODEL", "deepseek-v4-1-flash-1017")
 CARBON_MAX_OUTPUT_TOKENS = int(os.getenv("CARBON_MAX_OUTPUT_TOKENS", "16384"))
 CARBON_REASONING_EFFORT = os.getenv("CARBON_REASONING_EFFORT", "medium")
 
 # 3. Orien Horizon (Deep 30k Repo Scans) -> Google AI Studio Gemini 4 Hydrogen
-HORIZON_API_KEY = os.getenv("HORIZON_AI_API_KEY")
+SERVER_HORIZON_API_KEY = os.getenv("HORIZON_AI_API_KEY")
 HORIZON_BASE_URL = os.getenv(
     "HORIZON_AI_BASE_URL",
     "https://generativelanguage.googleapis.com/v1beta/openai/",
 )
 HORIZON_MODEL = os.getenv("HORIZON_AI_MODEL", "gemini-4-hydrogen")
-HORIZON_MAX_OUTPUT_TOKENS = int(os.getenv("HORIZON_MAX_OUTPUT_TOKENS", "65536"))
+HORIZON_MAX_OUTPUT_TOKENS = int(os.getenv("HORIZON_AI_MAX_OUTPUT_TOKENS", "65536"))
 HORIZON_REASONING_EFFORT = os.getenv("HORIZON_REASONING_EFFORT", "medium")
 
 # Strict Server-Side Guardrails (~4 chars per token)
@@ -129,30 +138,65 @@ class RunChecksResponse(BaseModel):
     python_used: str = ""
 
 
-def get_chat_client() -> OpenAI:
-    if not CHAT_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing AI_API_KEY in backend/.env.",
-        )
-    return OpenAI(api_key=CHAT_API_KEY, base_url=CHAT_BASE_URL)
+def can_use_server_fallback(passcode: str | None) -> bool:
+    if not OWNER_PASSCODE:
+        return True
+    return bool(passcode and passcode.strip() == OWNER_PASSCODE)
 
 
-def get_edit_client(engine: Literal["carbon", "horizon"]) -> OpenAI:
+def get_chat_client(
+    byok_coarena_key: str | None,
+    owner_passcode: str | None,
+) -> OpenAI:
+    if byok_coarena_key and byok_coarena_key.strip():
+        return OpenAI(api_key=byok_coarena_key.strip(), base_url=CHAT_BASE_URL)
+
+    if can_use_server_fallback(owner_passcode) and SERVER_CHAT_API_KEY:
+        return OpenAI(api_key=SERVER_CHAT_API_KEY, base_url=CHAT_BASE_URL)
+
+    raise HTTPException(
+        status_code=401,
+        detail=(
+            "CoArena API key required. Click 'API Keys' in the top bar to add your "
+            "CoArena key (or enter the Owner Passcode)."
+        ),
+    )
+
+
+def get_edit_client(
+    engine: Literal["carbon", "horizon"],
+    byok_coarena_key: str | None,
+    byok_google_key: str | None,
+    owner_passcode: str | None,
+) -> OpenAI:
     if engine == "horizon":
-        if not HORIZON_API_KEY:
-            raise HTTPException(
-                status_code=500,
-                detail="Missing HORIZON_AI_API_KEY in backend/.env for Orien Horizon (Google AI Studio).",
-            )
-        return OpenAI(api_key=HORIZON_API_KEY, base_url=HORIZON_BASE_URL)
+        if byok_google_key and byok_google_key.strip():
+            return OpenAI(api_key=byok_google_key.strip(), base_url=HORIZON_BASE_URL)
 
-    if not CARBON_API_KEY:
+        if can_use_server_fallback(owner_passcode) and SERVER_HORIZON_API_KEY:
+            return OpenAI(api_key=SERVER_HORIZON_API_KEY, base_url=HORIZON_BASE_URL)
+
         raise HTTPException(
-            status_code=500,
-            detail="Missing CARBON_AI_API_KEY in backend/.env for Orien Carbon.",
+            status_code=401,
+            detail=(
+                "Google AI Studio API key required for Orien Horizon (30k). "
+                "Click 'API Keys' in the header to add your Google AI Studio key."
+            ),
         )
-    return OpenAI(api_key=CARBON_API_KEY, base_url=CARBON_BASE_URL)
+
+    if byok_coarena_key and byok_coarena_key.strip():
+        return OpenAI(api_key=byok_coarena_key.strip(), base_url=CARBON_BASE_URL)
+
+    if can_use_server_fallback(owner_passcode) and SERVER_CARBON_API_KEY:
+        return OpenAI(api_key=SERVER_CARBON_API_KEY, base_url=CARBON_BASE_URL)
+
+    raise HTTPException(
+        status_code=401,
+        detail=(
+            "CoArena API key required for Orien Carbon (6k). "
+            "Click 'API Keys' in the header to add your CoArena key."
+        ),
+    )
 
 
 def estimate_tokens(text: str) -> int:
@@ -161,7 +205,6 @@ def estimate_tokens(text: str) -> int:
 
 def normalize_local_path(raw_path: str) -> Path:
     cleaned = raw_path.strip().strip('"').strip("'")
-    # Convert Git Bash /c/Users/... style paths to C:/Users/... on Windows
     if os.name == "nt":
         match = re.match(r"^/([a-zA-Z])/(.*)$", cleaned)
         if match:
@@ -188,7 +231,6 @@ def resolve_relative_repo_file(root: Path, raw_file: str) -> str | None:
     if direct.exists():
         return norm
 
-    # Strip leading repo folder prefix if present (e.g., "mesa/mesa/model.py" -> "mesa/model.py")
     parts = norm.split("/")
     if len(parts) > 1 and parts[0].lower() == root.name.lower():
         stripped = "/".join(parts[1:])
@@ -214,7 +256,6 @@ def discover_matching_tests(root: Path, resolved_files: list[str]) -> list[str]:
 
         expected_test_name = f"test_{p.stem}.py"
         for match in root.rglob(expected_test_name):
-            # Ignore virtualenvs & caches
             if any(
                 part in {".venv", "venv", ".git", "__pycache__", "node_modules"}
                 for part in match.parts
@@ -232,6 +273,8 @@ def discover_matching_tests(root: Path, resolved_files: list[str]) -> list[str]:
 def read_root():
     return {
         "status": "Orien backend is running",
+        "byok_enabled": True,
+        "owner_passcode_required_for_server_keys": bool(OWNER_PASSCODE),
         "engines": {
             "carbon": {"model": CARBON_MODEL, "max_input_tokens": CARBON_MAX_INPUT_TOKENS},
             "horizon": {"model": HORIZON_MODEL, "max_input_tokens": HORIZON_MAX_INPUT_TOKENS},
@@ -243,33 +286,32 @@ def read_root():
 def health_check():
     return {
         "ok": True,
-        "ask_orien": {
-            "configured": bool(CHAT_API_KEY),
-            "model": CHAT_MODEL,
-        },
+        "byok_enabled": True,
+        "owner_passcode_protected": bool(OWNER_PASSCODE),
         "orien_carbon": {
-            "configured": bool(CARBON_API_KEY),
+            "provider": "CoArena",
             "model": CARBON_MODEL,
             "max_input_tokens": CARBON_MAX_INPUT_TOKENS,
-            "reasoning_effort": CARBON_REASONING_EFFORT,
         },
         "orien_horizon": {
-            "configured": bool(HORIZON_API_KEY),
+            "provider": "Google AI Studio",
             "model": HORIZON_MODEL,
             "max_input_tokens": HORIZON_MAX_INPUT_TOKENS,
-            "max_output_tokens": HORIZON_MAX_OUTPUT_TOKENS,
-            "reasoning_effort": HORIZON_REASONING_EFFORT,
         },
     }
 
 
 @app.post("/chat")
-def chat_with_orien(payload: ChatRequest):
+def chat_with_orien(
+    payload: ChatRequest,
+    x_coarena_key: str | None = Header(default=None),
+    x_owner_passcode: str | None = Header(default=None),
+):
     message = payload.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
-    client = get_chat_client()
+    client = get_chat_client(x_coarena_key, x_owner_passcode)
 
     system_prompt = (
         "You are Orien, a concise, accurate AI engineering assistant. "
@@ -301,7 +343,12 @@ def chat_with_orien(payload: ChatRequest):
 
 
 @app.post("/edit", response_model=EditResponse)
-def propose_edit(payload: EditRequest):
+def propose_edit(
+    payload: EditRequest,
+    x_coarena_key: str | None = Header(default=None),
+    x_google_studio_key: str | None = Header(default=None),
+    x_owner_passcode: str | None = Header(default=None),
+):
     message = payload.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Problem description cannot be empty.")
@@ -328,7 +375,12 @@ def propose_edit(payload: EditRequest):
             ),
         )
 
-    client = get_edit_client(engine)
+    client = get_edit_client(
+        engine,
+        x_coarena_key,
+        x_google_studio_key,
+        x_owner_passcode,
+    )
 
     system_prompt = (
         "You are Orien, a surgical code-editing engine. "
@@ -395,14 +447,18 @@ def propose_edit(payload: EditRequest):
 
 
 @app.post("/draft-issue", response_model=DraftIssueResponse)
-def draft_github_issue(payload: DraftIssueRequest):
+def draft_github_issue(
+    payload: DraftIssueRequest,
+    x_coarena_key: str | None = Header(default=None),
+    x_owner_passcode: str | None = Header(default=None),
+):
     if not payload.chat_history:
         raise HTTPException(
             status_code=400,
             detail="Safety audit required in Proposal Chat before drafting a GitHub Issue.",
         )
 
-    client = get_chat_client()
+    client = get_chat_client(x_coarena_key, x_owner_passcode)
 
     changes_block = "\n\n---\n\n".join(
         f"FILE: {c.file} ({c.action})\n"
@@ -537,7 +593,6 @@ def run_local_checks(payload: RunChecksRequest):
     pytest_output = ""
     discovered_tests: list[str] = []
 
-    # 1. Run Ruff Check on target files (or whole repo if none specified)
     if payload.run_ruff:
         py_targets = [f for f in resolved_targets if f.endswith(".py")]
         ruff_cmd = [python_exe, "-m", "ruff", "check", *(py_targets if py_targets else ["."])]
@@ -562,7 +617,6 @@ def run_local_checks(payload: RunChecksRequest):
             ruff_passed = False
             ruff_output = "ruff check timed out after 30s."
 
-    # 2. Discover & Run Pytest
     if payload.run_pytest:
         custom = payload.custom_pytest_target.strip()
         if custom:

@@ -1,18 +1,17 @@
 "use client";
 
-import { useMemo, useState, type ReactNode } from "react";
-
-import type { RepositoryAnalysis } from "@/lib/repositoryAnalyzer";
-import type { EditProposal } from "@/lib/type";
-
+import { useState, useRef, type ReactNode } from "react";
 import {
   ENGINE_CONFIG,
   MAX_FILE_CHARS,
-  estimateContextTotalTokens,
+  estimateTokens,
   getContextStatus,
   getFilePath,
   type OrienEngine,
 } from "@/lib/context";
+import type { RepositoryAnalysis } from "@/lib/repositoryAnalyzer";
+import { API_BASE_URL, getOrienHeaders } from "@/lib/api";
+import type { EditProposal } from "@/lib/types";
 
 type WorkspaceProps = {
   selectedFiles: File[];
@@ -21,7 +20,7 @@ type WorkspaceProps = {
   analysis: RepositoryAnalysis | null;
   dependenciesSlot?: ReactNode;
   onFilesSelected: (files: File[]) => void;
-  onAddFiles?: (files: File[]) => void;
+  onAddFiles: (files: File[]) => void;
   activeFile: File | null;
   filePreview: string;
   previewFileName: string;
@@ -32,64 +31,45 @@ export default function Workspace({
   selectedFiles,
   contextFiles,
   engine,
-  analysis,
   dependenciesSlot,
   onFilesSelected,
+  onAddFiles,
   activeFile,
   filePreview,
   previewFileName,
   onProposalChange,
 }: WorkspaceProps) {
-  // AI Agent State
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [task, setTask] = useState("");
-  const [isAgentRunning, setIsAgentRunning] = useState(false);
-  const [agentResponse, setAgentResponse] = useState("");
-  const [agentError, setAgentError] = useState("");
-
-  // Edit Proposal State
-  const [isProposing, setIsProposing] = useState(false);
-  const [proposalError, setProposalError] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [errorMessage, setErrorMessage] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
 
   const activeEngine = ENGINE_CONFIG[engine];
 
-  const estimatedContextTokens = useMemo(
-    () => estimateContextTotalTokens(contextFiles),
-    [contextFiles]
+  const usableFiles = contextFiles.filter(
+    (file) => getContextStatus(file) === "ok"
   );
 
-  const isOverEngineLimit = estimatedContextTokens > activeEngine.targetLimit;
+  const estimatedContextTokens = usableFiles.reduce((total, file) => {
+    const cappedChars = Math.min(file.size, MAX_FILE_CHARS);
+    return total + Math.max(1, Math.ceil(cappedChars / 4));
+  }, 0);
 
-  // Build Repository Context (strictly bounded by activeEngine.maxChars including metadata)
-  async function buildRepositoryContext(): Promise<string> {
+  const estimatedPromptTokens =
+    estimatedContextTokens + estimateTokens(task) + 350;
+  const isOverEngineLimit = estimatedPromptTokens > activeEngine.maxTokens;
+
+  async function buildRepositoryContext() {
+    if (usableFiles.length === 0) {
+      return "";
+    }
+
     const contextParts: string[] = [];
     let totalCharacters = 0;
 
-    if (analysis) {
-      const selectedPathSet = new Set(contextFiles.map(getFilePath));
-      const relevantDeps = analysis.dependencies.filter((dep) =>
-        selectedPathSet.has(dep.file)
-      );
-
-      const compactAnalysis = {
-        languages: analysis.languages,
-        frameworks: analysis.frameworks,
-        selectedFileImports: relevantDeps,
-      };
-
-      const analysisBlock =
-        "REPOSITORY ANALYSIS: " + JSON.stringify(compactAnalysis);
-
-      if (analysisBlock.length <= 800) {
-        contextParts.push(analysisBlock);
-        totalCharacters += analysisBlock.length;
-      }
-    }
-
-    for (const file of contextFiles) {
-      if (getContextStatus(file) !== "ok") {
-        continue;
-      }
-
+    for (const file of usableFiles) {
       if (totalCharacters >= activeEngine.maxChars) {
         break;
       }
@@ -97,54 +77,32 @@ export default function Workspace({
       const content = await file.text();
       const remaining = activeEngine.maxChars - totalCharacters;
       const available = Math.min(MAX_FILE_CHARS, remaining);
-      const safeContent = content.slice(0, available);
+      const block = `FILE: ${getFilePath(file)}\n${content.slice(0, available)}`;
 
-      const fileBlock = `FILE: ${getFilePath(file)}\n${safeContent}`;
-      contextParts.push(fileBlock);
-      totalCharacters += fileBlock.length;
+      contextParts.push(block);
+      totalCharacters += block.length;
     }
 
     return contextParts.join("\n\n");
   }
 
-  // Send Repository Context to AI (/chat)
-  async function handleStartAgent() {
+  async function handleAskOrien() {
     if (!task.trim()) {
-      setAgentError("Please describe what you want Orien to do.");
+      setErrorMessage("Please describe a problem or question first.");
       return;
     }
 
-    if (selectedFiles.length === 0) {
-      setAgentError("Please upload a repository first.");
-      return;
-    }
-
-    if (contextFiles.length === 0) {
-      setAgentError(
-        "Select at least one file to send (use the checkboxes in the sidebar)."
-      );
-      return;
-    }
-
-    if (isOverEngineLimit) {
-      setAgentError(
-        `Blocked: ~${estimatedContextTokens.toLocaleString()} tokens exceeds ${activeEngine.name}'s ${activeEngine.targetLimit.toLocaleString()}-token limit.`
-      );
-      return;
-    }
-
-    setIsAgentRunning(true);
-    setAgentError("");
-    setAgentResponse("");
+    setIsLoading(true);
+    setAnswer("");
+    setErrorMessage("");
+    onProposalChange(null);
 
     try {
       const repositoryContext = await buildRepositoryContext();
 
-      const response = await fetch("http://127.0.0.1:8000/chat", {
+      const response = await fetch(`${API_BASE_URL}/chat`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: getOrienHeaders(),
         body: JSON.stringify({
           message: task,
           repository_context: repositoryContext,
@@ -154,66 +112,53 @@ export default function Workspace({
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(
-          data.detail || "Orien could not complete the request."
-        );
+        throw new Error(data.detail || "Something went wrong.");
       }
 
-      if (!data.success || typeof data.answer !== "string") {
-        throw new Error("The AI returned an unexpected response.");
-      }
-
-      setAgentResponse(data.answer);
+      setAnswer(data.answer);
     } catch (error) {
-      console.warn("Agent error:", error);
-      setAgentError(
+      console.error(error);
+      setErrorMessage(
         error instanceof Error
           ? error.message
-          : "Something went wrong while contacting Orien."
+          : "Could not reach Orien backend."
       );
     } finally {
-      setIsAgentRunning(false);
+      setIsLoading(false);
     }
   }
 
-  // Request Edit Proposal from AI (/edit routed to Carbon or Horizon)
   async function handleProposeEdit() {
     if (!task.trim()) {
-      setProposalError("Please describe what you want Orien to change.");
+      setErrorMessage("Please describe what you want Orien to change.");
       return;
     }
 
-    if (selectedFiles.length === 0) {
-      setProposalError("Please upload a repository first.");
-      return;
-    }
-
-    if (contextFiles.length === 0) {
-      setProposalError(
-        "Select at least one file to send (use the checkboxes in the sidebar)."
+    if (usableFiles.length === 0) {
+      setErrorMessage(
+        "Select at least one text file in the sidebar before proposing edits."
       );
       return;
     }
 
     if (isOverEngineLimit) {
-      setProposalError(
-        `Blocked: ~${estimatedContextTokens.toLocaleString()} tokens exceeds ${activeEngine.name}'s ${activeEngine.targetLimit.toLocaleString()}-token limit.`
+      setErrorMessage(
+        `Estimated input (~${estimatedPromptTokens.toLocaleString()} tokens) exceeds ${activeEngine.label}'s ${activeEngine.maxTokens.toLocaleString()}-token cap. Deselect extra files or switch to Orien Horizon.`
       );
       return;
     }
 
-    setIsProposing(true);
-    setProposalError("");
+    setIsLoading(true);
+    setAnswer("");
+    setErrorMessage("");
     onProposalChange(null);
 
     try {
       const repositoryContext = await buildRepositoryContext();
 
-      const response = await fetch("http://127.0.0.1:8000/edit", {
+      const response = await fetch(`${API_BASE_URL}/edit`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: getOrienHeaders(),
         body: JSON.stringify({
           message: task,
           repository_context: repositoryContext,
@@ -225,13 +170,11 @@ export default function Workspace({
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(
-          data.detail || "Orien could not generate an edit proposal."
-        );
+        throw new Error(data.detail || "Edit request failed.");
       }
 
       if (!data.success || !Array.isArray(data.changes)) {
-        throw new Error("The AI returned an unexpected response.");
+        throw new Error("Orien returned an invalid edit response.");
       }
 
       onProposalChange({
@@ -239,229 +182,182 @@ export default function Workspace({
         changes: data.changes,
       });
     } catch (error) {
-      console.warn("Edit proposal error:", error);
-      setProposalError(
+      console.error(error);
+      setErrorMessage(
         error instanceof Error
           ? error.message
-          : "Something went wrong while contacting Orien."
+          : "Could not reach Orien backend."
       );
     } finally {
-      setIsProposing(false);
+      setIsLoading(false);
     }
   }
 
-  // Calculate Repository Statistics
-  const folderPaths = new Set<string>();
-
-  selectedFiles.forEach((file) => {
-    const path = file.webkitRelativePath || file.name;
-    const parts = path.split("/");
-
-    parts.slice(0, -1).forEach((_, index) => {
-      folderPaths.add(parts.slice(0, index + 1).join("/"));
-    });
-  });
-
-  const folderCount = folderPaths.size;
-
-  const codeExtensions = [
-    ".js", ".jsx", ".ts", ".tsx",
-    ".py", ".java", ".cpp", ".c",
-    ".html", ".css", ".json",
-    ".go", ".rs", ".php",
-  ];
-
-  const codeFileCount = selectedFiles.filter((file) =>
-    codeExtensions.some((ext) => file.name.toLowerCase().endsWith(ext))
-  ).length;
-
   return (
-    <div className="p-6">
-      {/* Repository Upload */}
-      <div className="border border-dashed border-zinc-700 rounded-2xl p-10 text-center mb-8">
-        <h3 className="text-lg font-medium mb-3">
-          {selectedFiles.length > 0
-            ? "Repository Loaded"
-            : "Start with a repository"}
-        </h3>
-
-        <p className="text-sm text-zinc-500 mb-6">
-          {selectedFiles.length > 0
-            ? `${selectedFiles.length} files loaded into Orien.`
-            : "Bring your project files into Orien."}
-        </p>
-
-        <label className="inline-block bg-white text-black px-5 py-3 rounded-lg text-sm font-bold cursor-pointer hover:bg-zinc-200 transition">
-          Upload Repository
-          <input
-            type="file"
-            className="hidden"
-            multiple
-            ref={(element) => {
-              element?.setAttribute("webkitdirectory", "");
-            }}
-            onChange={(event) => {
-              const ignoredFolders = [
-                "node_modules",
-                ".git",
-                ".next",
-                "dist",
-                "build",
-                "coverage",
-                "__pycache__",
-                ".venv",
-              ];
-
-              const files = Array.from(event.target.files ?? []).filter(
-                (file) => {
-                  const path = file.webkitRelativePath || file.name;
-                  return !path
-                    .split("/")
-                    .some((part) => ignoredFolders.includes(part));
-                }
-              );
-
-              onFilesSelected(files);
-              event.target.value = "";
-            }}
-          />
-        </label>
-
-        {/* File Preview */}
-        {activeFile && (
-          <div className="mt-8 text-left">
-            <h4 className="text-sm font-semibold mb-3">
-              Previewing: {previewFileName}
-            </h4>
-
-            <pre className="bg-black/40 border border-white/10 rounded-xl p-4 text-xs text-green-400 overflow-auto max-h-96 whitespace-pre-wrap break-words">
-              {filePreview}
-            </pre>
-          </div>
-        )}
-      </div>
-
-      {/* Repository Statistics */}
-      {selectedFiles.length > 0 && (
-        <div className="grid grid-cols-3 gap-4 mb-8">
-          <div className="border border-white/10 rounded-xl p-5">
-            <p className="text-sm text-zinc-500">Total Files</p>
-            <h3 className="text-2xl font-semibold mt-2">
-              {selectedFiles.length}
-            </h3>
-          </div>
-
-          <div className="border border-white/10 rounded-xl p-5">
-            <p className="text-sm text-zinc-500">Folders</p>
-            <h3 className="text-2xl font-semibold mt-2">{folderCount}</h3>
-          </div>
-
-          <div className="border border-white/10 rounded-xl p-5">
-            <p className="text-sm text-zinc-500">Code Files</p>
-            <h3 className="text-2xl font-semibold mt-2">{codeFileCount}</h3>
-          </div>
-        </div>
-      )}
-
-      {/* Dependencies Graph moves here automatically once a Proposal is generated */}
-      {dependenciesSlot && <div className="mb-8">{dependenciesSlot}</div>}
-
-      {/* Task Description & AI Agent */}
+    <div className="space-y-6">
       <div className="border border-white/10 rounded-2xl p-6 bg-white/[0.02]">
-        <div className="flex items-center justify-between gap-3 mb-3">
-          <h3 className="font-medium">Describe your problem</h3>
-
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-xl font-semibold">Ask Orien</h2>
           <span
-            className={`text-[11px] font-mono rounded-full px-2.5 py-0.5 border ${
+            className={`text-xs font-mono px-2.5 py-1 rounded-full border ${
               engine === "horizon"
-                ? "text-sky-300 border-sky-500/30 bg-sky-500/10"
-                : "text-emerald-300 border-emerald-500/30 bg-emerald-500/10"
+                ? "text-purple-300 border-purple-500/30 bg-purple-500/10"
+                : "text-blue-300 border-blue-500/30 bg-blue-500/10"
             }`}
           >
-            {engine === "horizon" ? "🌌" : "⚡"} {activeEngine.name} · max{" "}
-            {activeEngine.targetLimit.toLocaleString()}t
+            {activeEngine.label} · {activeEngine.maxTokens.toLocaleString()} cap
+          </span>
+        </div>
+
+        <p className="text-zinc-400 text-sm mt-1">
+          Upload a repository folder or individual files, select context files
+          on the left, and ask Orien or propose targeted code edits.
+        </p>
+
+        {/* Hidden Folder Input */}
+        <input
+          ref={folderInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(event) => {
+            const files = Array.from(event.target.files ?? []);
+            onFilesSelected(files);
+            event.target.value = "";
+          }}
+          {...({
+            webkitdirectory: "",
+            directory: "",
+          } as React.InputHTMLAttributes<HTMLInputElement>)}
+        />
+
+        {/* Hidden Individual Files Input */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(event) => {
+            const files = Array.from(event.target.files ?? []);
+            if (files.length === 0) return;
+            if (selectedFiles.length > 0) {
+              onAddFiles(files);
+            } else {
+              onFilesSelected(files);
+            }
+            event.target.value = "";
+          }}
+        />
+
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={() => folderInputRef.current?.click()}
+            className="bg-white text-black px-4 py-2 rounded-lg text-sm font-medium hover:bg-zinc-200 transition"
+          >
+            Upload Repository Folder
+          </button>
+
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="border border-white/15 bg-white/5 hover:bg-white/10 text-zinc-200 px-4 py-2 rounded-lg text-sm font-medium transition"
+          >
+            {selectedFiles.length > 0 ? "+ Add Files" : "Upload Files"}
+          </button>
+
+          <span className="text-sm text-zinc-400">
+            {selectedFiles.length > 0
+              ? `${selectedFiles.length} files loaded (${usableFiles.length} in context)`
+              : "No files uploaded"}
           </span>
         </div>
 
         <textarea
           value={task}
           onChange={(event) => setTask(event.target.value)}
-          placeholder="Explain the issue you want Orien to solve..."
-          className="w-full h-32 bg-transparent border border-white/10 rounded-xl p-4 text-sm outline-none resize-none"
+          placeholder="Describe a bug to hunt, a refactor, or a question about the selected files..."
+          className="w-full h-32 mt-5 bg-black/40 border border-white/10 focus:border-blue-500 rounded-xl p-4 text-sm text-white placeholder:text-zinc-500 outline-none resize-none"
         />
 
-        {isOverEngineLimit && (
-          <div className="mt-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-xs text-red-300">
-            🛑 Request blocked: selected context is{" "}
-            <span className="font-mono font-semibold">
-              ~{estimatedContextTokens.toLocaleString()} tokens
-            </span>
-            , exceeding{" "}
-            <span className="font-semibold">{activeEngine.name}</span>&apos;s{" "}
-            <span className="font-mono font-semibold">
-              {activeEngine.targetLimit.toLocaleString()}-token
-            </span>{" "}
-            limit. Click <span className="font-semibold">↩ Undo</span> in the
-            sidebar or untick files to stay within limit.
-          </div>
-        )}
-
-        <div className="flex justify-between items-center mt-4">
-          <p className="text-xs text-zinc-500">{activeEngine.providerLabel}</p>
-
-          <div className="flex gap-3">
-            <button
-              onClick={handleStartAgent}
-              disabled={
-                isAgentRunning ||
-                isProposing ||
-                isOverEngineLimit ||
-                selectedFiles.length === 0 ||
-                !task.trim()
-              }
-              className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2 rounded-lg text-sm transition"
-            >
-              {isAgentRunning ? "Orien is thinking..." : "Ask Orien"}
-            </button>
-
-            <button
-              onClick={handleProposeEdit}
-              disabled={
-                isAgentRunning ||
-                isProposing ||
-                isOverEngineLimit ||
-                selectedFiles.length === 0 ||
-                !task.trim()
-              }
-              className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2 rounded-lg text-sm transition"
-            >
-              {isProposing
-                ? `Running ${activeEngine.name}...`
-                : "Propose Edit"}
-            </button>
-          </div>
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+          <span
+            className={
+              isOverEngineLimit ? "text-red-400" : "text-zinc-400"
+            }
+          >
+            Est. edit payload: ~{estimatedPromptTokens.toLocaleString()} /{" "}
+            {activeEngine.maxTokens.toLocaleString()} tokens
+          </span>
+          <span className="text-zinc-500">
+            Reasoning: {activeEngine.reasoningEffort}
+          </span>
         </div>
 
-        {agentError && (
-          <p className="text-sm text-red-400 mt-4">{agentError}</p>
+        {isOverEngineLimit && (
+          <p className="mt-2 text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+            Token guardrail active: remove files from context or switch to Orien
+            Horizon (30k) before proposing edits.
+          </p>
         )}
 
-        {proposalError && (
-          <p className="text-sm text-red-400 mt-4">{proposalError}</p>
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={handleAskOrien}
+            disabled={isLoading}
+            className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-5 py-2.5 rounded-xl text-sm font-medium transition"
+          >
+            {isLoading ? "Thinking..." : "Ask Orien"}
+          </button>
+
+          <button
+            type="button"
+            onClick={handleProposeEdit}
+            disabled={isLoading || isOverEngineLimit}
+            className="bg-white/10 hover:bg-white/15 disabled:opacity-40 disabled:cursor-not-allowed px-5 py-2.5 rounded-xl text-sm font-medium transition"
+          >
+            {isLoading
+              ? "Thinking..."
+              : `Propose Edit (${activeEngine.label})`}
+          </button>
+        </div>
+
+        {errorMessage && (
+          <p className="mt-4 text-sm text-red-400">{errorMessage}</p>
         )}
 
-        {agentResponse && (
-          <div className="mt-6 border border-white/10 rounded-xl p-5 bg-black/30">
-            <h4 className="font-semibold text-white mb-3">
-              Orien&apos;s Analysis
-            </h4>
-
-            <pre className="text-sm text-zinc-300 whitespace-pre-wrap break-words font-sans">
-              {agentResponse}
-            </pre>
+        {answer && (
+          <div className="mt-5 border border-white/10 rounded-xl p-4 bg-black/30">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-2">
+              Orien Response
+            </h3>
+            <p className="text-sm text-zinc-200 whitespace-pre-wrap leading-relaxed">
+              {answer}
+            </p>
           </div>
         )}
       </div>
+
+      {dependenciesSlot}
+
+      {/* Built-in Active File Preview */}
+      {activeFile && (
+        <div className="border border-white/10 rounded-2xl overflow-hidden bg-white/[0.02]">
+          <div className="px-5 py-3 border-b border-white/10 flex items-center justify-between gap-3 bg-black/30">
+            <span className="text-xs font-mono text-zinc-200 truncate">
+              {previewFileName}
+            </span>
+            <span className="text-[11px] font-mono text-zinc-500 shrink-0">
+              {filePreview.split("\n").length} lines ·{" "}
+              {filePreview.length.toLocaleString()} chars
+            </span>
+          </div>
+          <pre className="p-5 text-xs font-mono text-zinc-300 overflow-x-auto max-h-96 whitespace-pre leading-relaxed">
+            {filePreview}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }
